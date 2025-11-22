@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>本地 PDF → 图片（使用 PDF.js）</title>
+  <style>
+    body{font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;padding:18px;max-width:1100px;margin:0 auto;color:#111}
+    h1{font-size:20px;margin-bottom:6px}
+    .controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+    label{font-size:13px}
+    input[type=file]{padding:6px}
+    .page{border:1px solid #e6e6e6;padding:10px;margin-bottom:14px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,0.03)}
+    canvas{display:block;border:1px solid #ddd;margin-bottom:8px;max-width:100%}
+    .btn{display:inline-block;padding:8px 12px;border-radius:8px;background:#0b69ff;color:#fff;text-decoration:none;font-size:13px}
+    .small{font-size:13px;color:#555}
+    .page-meta{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    .options{display:flex;gap:8px;align-items:center}
+    .progress{height:8px;background:#f1f1f1;border-radius:999px;overflow:hidden;width:240px}
+    .progress > i{display:block;height:100%;background:#0b69ff;width:0%}
+    footer{margin-top:18px;color:#666;font-size:13px}
+  </style>
+</head>
+<body>
+  <h1>本地 PDF → 图片（前端，使用 PDF.js）</h1>
+  <p class="small">将本地 PDF 文件拖入或选择文件，页面会渲染为 Canvas，你可以单页下载为 PNG/JPEG。所有转换在浏览器端完成，不上传任何文件。</p>
+
+  <div class="controls">
+    <label>
+      选择 PDF：
+      <input id="fileInput" type="file" accept="application/pdf">
+    </label>
+
+    <label class="options">
+      缩放：
+      <input id="scale" type="number" value="1.5" step="0.1" min="0.1" style="width:80px">
+    </label>
+
+    <label class="options">
+      格式：
+      <select id="format">
+        <option value="png">PNG（无损）</option>
+        <option value="jpeg">JPEG（有损，可调质量）</option>
+      </select>
+    </label>
+
+    <label class="options">
+      JPEG 质量：
+      <input id="quality" type="number" min="0.1" max="1" step="0.05" value="0.8" style="width:80px">
+    </label>
+
+    <button id="clearBtn" class="btn" style="background:#6b7280">清除</button>
+  </div>
+
+  <div class="small">转换进度： <span id="status">空</span></div>
+  <div class="progress" aria-hidden style="margin:8px 0"><i id="progressBar"></i></div>
+
+  <div id="pagesContainer"></div>
+
+  <footer>
+    <div>说明：此页面使用 <a href="https://mozilla.github.io/pdf.js/" target="_blank">PDF.js</a> 在浏览器端渲染 PDF。适用于单机调试与小文件测试；大文件/大量页数可能占用较多内存。</div>
+  </footer>
+
+  <!-- PDF.js CDN（release） -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+  <script>
+    // Worker 路径（确保与加载的 pdf.js 版本匹配）
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+
+    const fileInput = document.getElementById('fileInput');
+    const pagesContainer = document.getElementById('pagesContainer');
+    const statusEl = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const scaleInput = document.getElementById('scale');
+    const formatSelect = document.getElementById('format');
+    const qualityInput = document.getElementById('quality');
+    const clearBtn = document.getElementById('clearBtn');
+
+    let currentPdf = null;
+
+    function setStatus(text){ statusEl.textContent = text; }
+    function setProgress(p){ progressBar.style.width = Math.round(p*100) + '%'; }
+
+    fileInput.addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if(!f) return;
+      if(f.type !== 'application/pdf' && !f.name.toLowerCase().endsWith('.pdf')){
+        alert('请选择 PDF 文件');
+        return;
+      }
+
+      // 读取文件为 ArrayBuffer
+      setStatus('读取文件...');
+      setProgress(0.02);
+      const arrayBuffer = await f.arrayBuffer();
+
+      setStatus('加载 PDF...');
+      setProgress(0.05);
+
+      // 清空上次结果
+      pagesContainer.innerHTML = '';
+
+      const loadingTask = pdfjsLib.getDocument({data: arrayBuffer});
+      try{
+        currentPdf = await loadingTask.promise;
+      }catch(err){
+        console.error(err);
+        alert('无法加载 PDF，可能文件损坏或版本不兼容。\n详细信息见控制台。');
+        setStatus('加载失败');
+        setProgress(0);
+        return;
+      }
+
+      const pageCount = currentPdf.numPages;
+      setStatus(`PDF 加载完成，共 ${pageCount} 页`);
+
+      // 逐页渲染（按需）
+      for(let i=1;i<=pageCount;i++){
+        setStatus(`渲染第 ${i} / ${pageCount} 页...`);
+        setProgress((i-1)/pageCount*0.9 + 0.05);
+        await renderPage(i);
+      }
+
+      setStatus('全部渲染完成');
+      setProgress(1);
+
+    });
+
+    async function renderPage(pageNumber){
+      const page = await currentPdf.getPage(pageNumber);
+      const scale = parseFloat(scaleInput.value) || 1.5;
+      const viewport = page.getViewport({scale});
+
+      // create elements
+      const wrapper = document.createElement('div');
+      wrapper.className = 'page';
+
+      const meta = document.createElement('div');
+      meta.className = 'page-meta';
+      meta.innerHTML = `<strong>Page ${pageNumber}</strong> <span class="small">(${Math.round(viewport.width)}×${Math.round(viewport.height)} px)</span>`;
+
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+
+      // render into canvas
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      // controls: preview + download
+      const controls = document.createElement('div');
+      controls.style.display = 'flex';
+      controls.style.gap = '8px';
+      controls.style.alignItems = 'center';
+
+      const downloadBtn = document.createElement('a');
+      downloadBtn.className = 'btn';
+      downloadBtn.textContent = '下载图片';
+      downloadBtn.href = '#';
+      downloadBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        downloadCanvasImage(canvas, pageNumber);
+      });
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn';
+      copyBtn.style.background = '#10b981';
+      copyBtn.textContent = '复制到剪贴板';
+      copyBtn.addEventListener('click', async () => {
+        try{
+          await copyCanvasToClipboard(canvas);
+          copyBtn.textContent = '已复制!';
+          setTimeout(()=>copyBtn.textContent='复制到剪贴板',1200);
+        }catch(err){
+          alert('复制失败：' + err.message);
+        }
+      });
+
+      const previewWrap = document.createElement('div');
+      previewWrap.appendChild(canvas);
+
+      controls.appendChild(downloadBtn);
+      controls.appendChild(copyBtn);
+
+      wrapper.appendChild(meta);
+      wrapper.appendChild(controls);
+      wrapper.appendChild(previewWrap);
+
+      pagesContainer.appendChild(wrapper);
+    }
+
+    function downloadCanvasImage(canvas, pageNumber){
+      const fmt = formatSelect.value || 'png';
+      let mime = 'image/png';
+      const quality = parseFloat(qualityInput.value) || 0.8;
+      if(fmt === 'jpeg') mime = 'image/jpeg';
+
+      // toBlob 下载
+      canvas.toBlob((blob) => {
+        if(!blob){
+          alert('生成图片失败');
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const safeFmt = fmt === 'jpeg' ? 'jpg' : 'png';
+        a.download = `page-${pageNumber}.${safeFmt}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }, mime, fmt === 'jpeg' ? quality : undefined);
+    }
+
+    async function copyCanvasToClipboard(canvas){
+      if(!navigator.clipboard || !navigator.clipboard.write) throw new Error('Clipboard API 不可用');
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(async (blob) => {
+          if(!blob) return reject(new Error('无法生成 Blob'));
+          const item = new ClipboardItem({ [blob.type]: blob });
+          try{
+            await navigator.clipboard.write([item]);
+            resolve();
+          }catch(err){
+            reject(err);
+          }
+        }, 'image/png');
+      });
+    }
+
+    // 当选项改变时，不自动重渲（避免大文件重复工作）。用户可手动重新选择文件。
+
+    clearBtn.addEventListener('click', ()=>{
+      pagesContainer.innerHTML = '';
+      fileInput.value = '';
+      currentPdf = null;
+      setStatus('空');
+      setProgress(0);
+    });
+
+    // 防止页面导航时丢失 Worker（调试友好）
+    window.addEventListener('unload', ()=>{ try{ pdfjsLib.GlobalWorkerOptions.workerSrc = ''; }catch(e){} });
+
+  </script>
+</body>
+</html>
